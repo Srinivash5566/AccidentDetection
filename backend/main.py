@@ -6,34 +6,19 @@ import os
 import tempfile
 import collections
 import base64
-from google import genai
+import google.generativeai as genai
 from PIL import Image
 import numpy as np
 from datetime import datetime
 from pymongo import MongoClient
-from fastapi.responses import JSONResponse
-from bson.json_util import dumps
-from bson import ObjectId
 from typing import Optional
+from twilio.rest import Client
+
 
 # Initialize FastAPI app
 app = FastAPI()
 
-# Google Gemini API
-genai_client = genai.Client(api_key="AIzaSyCkwbmGMWKltdkcDROczIqXoyfcD2KTLGU")
-
-# MongoDB connection
-client = MongoClient("mongodb://localhost:27017")  # Or use your MongoDB Atlas URI
-db = client["accident_detection"]
-accident_logs = db["logs"]
-
-# Frame buffer to capture clip
-frame_buffer = collections.deque(maxlen=120)
-accident_frame = None
-
-# Valid vehicle types
-VALID_VEHICLE_TYPES = ["car", "truck", "bus", "bike", "auto", "other"]
-
+# Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -42,9 +27,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# twilio config
+account_sid = 'AC5dd51f5d26113ffbadbc906df1fc9dfd'
+auth_token = '998c3bb6608b80663f6ab52d7510df5b'
+twilio_number = '+14159652912'
+destination_number = '+919360285416'
+
+try:
+    tClient = Client(account_sid, auth_token)
+    # Test the client configuration
+    account = tClient.api.accounts(account_sid).fetch()
+    print(f"Twilio account configured successfully: {account.friendly_name}")
+except Exception as init_error:
+    print(f"Twilio initialization error: {init_error}")
+    tClient = None
+    
+# Gemini setup
+genai.configure(api_key="AIzaSyCkwbmGMWKltdkcDROczIqXoyfcD2KTLGU")
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+# MongoDB setup
+client = MongoClient("mongodb://localhost:27017")
+db = client["accident_detection"]
+accident_logs = db["logs"]
+
+# Globals
+frame_buffer = collections.deque(maxlen=120)
+accident_frame = None
+VALID_VEHICLE_TYPES = ["car", "truck", "bus", "bike", "auto", "other"]
+
 def extract_frames(video_path, frame_interval=240):
     cap = cv2.VideoCapture(video_path)
-    frames_for_analysis = []
+    frames = []
     frame_count = 0
 
     while cap.isOpened():
@@ -53,76 +67,59 @@ def extract_frames(video_path, frame_interval=240):
             break
 
         frame_buffer.append(frame)
-
         if frame_count % frame_interval == 0:
-            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            frames_for_analysis.append((img, frame))
+            pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            frames.append((pil_img, frame))
 
         frame_count += 1
 
     cap.release()
-    return frames_for_analysis
+    return frames
 
 def save_video(frames, output_path, fps=30):
     if not frames:
-        print("No frames to save.")
         return None
 
-    try:
-        height, width, _ = frames[0].shape
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 codec
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    height, width, _ = frames[0].shape
+    fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 (better browser support)
 
-        for frame in frames:
-            out.write(frame)
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    for frame in frames:
+        out.write(frame)
+    out.release()
 
-        out.release()
-        print("Video saved to:", output_path)
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
         return output_path
-    except Exception as e:
-        print("Error saving video:", e)
-        return None
-
-def analyze_frame_with_gemini(frame: Image):
-    try:
-        response = genai_client.models.generate_content(
-            model="gemini-2.0-flash-lite",
-            contents=[frame, "Is there an accident? Reply True or False."]
-        )
-        print("Gemini response:", response.text)
-        return response.text.strip().lower()
-    except Exception as e:
-        print("Gemini API error:", e)
-        return "false"
-
-def detect_vehicle_type(frame: Image):
-    try:
-        response = genai_client.models.generate_content(
-            model="gemini-2.0-flash-lite",
-            contents=[frame, "What type of vehicle is in this accident? Choose one: car, truck, bus, bike, auto, or other."]
-        )
-        response_text = response.text.strip().lower()
-        print("Vehicle detection response:", response_text)
-        
-        # Extract the vehicle type from the response
-        for vehicle_type in VALID_VEHICLE_TYPES:
-            if vehicle_type in response_text:
-                return vehicle_type
-        
-        return "other"  # Default if no specific vehicle type is detected
-    except Exception as e:
-        print("Gemini API error in vehicle detection:", e)
-        return "other"
+    return None
 
 def frame_to_base64(frame):
     _, buffer = cv2.imencode('.jpg', frame)
     return base64.b64encode(buffer).decode('utf-8')
 
+def analyze_frame_with_gemini(image: Image) -> str:
+    try:
+        prompt = "Is there an accident? Reply True or False."
+        response = model.generate_content([image, prompt])
+        return response.text.strip().lower()
+    except Exception as e:
+        print("Gemini error:", e)
+        return "false"
+
+def detect_vehicle_type(image: Image) -> str:
+    try:
+        prompt = "What type of vehicle is in this accident? Choose one: car, truck, bus, bike, auto, or other."
+        response = model.generate_content([image, prompt])
+        text = response.text.lower()
+        for t in VALID_VEHICLE_TYPES:
+            if t in text:
+                return t
+        return "other"
+    except Exception as e:
+        print("Gemini vehicle type error:", e)
+        return "other"
+
 @app.post("/upload/")
-async def upload_video(
-    file: UploadFile = File(...),
-    vehicle_type: Optional[str] = Form(None)  # Accept manual vehicle type input
-):
+async def upload_video(file: UploadFile = File(...), vehicle_type: Optional[str] = Form(None)):
     frame_buffer.clear()
     global accident_frame
     accident_frame = None
@@ -135,164 +132,126 @@ async def upload_video(
         frames = extract_frames(video_path)
         os.remove(video_path)
 
-        detected_vehicle_type = None
-
         for pil_frame, cv_frame in frames:
             result = analyze_frame_with_gemini(pil_frame)
             if "true" in result:
                 accident_frame = cv_frame
-                
-                # Detect vehicle type if not provided manually
+
                 if not vehicle_type or vehicle_type not in VALID_VEHICLE_TYPES:
-                    detected_vehicle_type = detect_vehicle_type(pil_frame)
+                    vehicle_type = detect_vehicle_type(pil_frame)
                 else:
-                    detected_vehicle_type = vehicle_type.lower()
+                    vehicle_type = vehicle_type.lower()
 
-                # Save video
                 os.makedirs("videos", exist_ok=True)
-                video_filename = f"accident_clip_{os.getpid()}.mp4"
-                video_output_path = os.path.join("videos", video_filename)
-                saved_video_path = save_video(list(frame_buffer), video_output_path)
-
-                # Save image
                 os.makedirs("images", exist_ok=True)
-                frame_filename = f"accident_frame_{os.getpid()}.jpg"
-                frame_path = os.path.join("images", frame_filename)
-                cv2.imwrite(frame_path, accident_frame)
 
-                # Save metadata to MongoDB
-                now = datetime.now()
+                video_filename = f"accident_clip_{os.getpid()}.mp4"
+                image_filename = f"accident_frame_{os.getpid()}.jpg"
+                video_output_path = os.path.join("videos", video_filename)
+                image_output_path = os.path.join("images", image_filename)
+
+                saved_path = save_video(list(frame_buffer), video_output_path)
+                if not saved_path:
+                    return {"error": "Video saving failed. Possibly due to codec issue."}
+
+                cv2.imwrite(image_output_path, accident_frame)
+
                 accident_logs.insert_one({
-                    "timestamp": now,
+                    "timestamp": datetime.now(),
                     "video_path": video_output_path,
-                    "image_path": frame_path,
-                    "vehicle_type": detected_vehicle_type
+                    "image_path": image_output_path,
+                    "vehicle_type": vehicle_type
                 })
-
+                try:
+                    if tClient is None:
+                        print("Twilio client not initialized")
+                        raise Exception("Twilio client not available")
+                    
+                    sms_body = f"🚨 Accident detected!\nVehicle Type: {vehicle_type.capitalize()}\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    
+                    message = tClient.messages.create(
+                        body=sms_body,
+                        from_=twilio_number,
+                        to=destination_number
+                    )
+                    print(f"SMS sent successfully. Message SID: {message.sid}")
+                    print(f"SMS Status: {message.status}")
+                    
+                except Exception as sms_error:
+                    print(f"SMS sending failed: {sms_error}")
+                    # Log the specific error details
+                    if hasattr(sms_error, 'code'):
+                        print(f"Twilio Error Code: {sms_error.code}")
+                    if hasattr(sms_error, 'msg'):
+                        print(f"Twilio Error Message: {sms_error.msg}")
                 return {
                     "accident_detected": True,
                     "video_path": f"/accident_video/{video_filename}",
-                    "frame_path": f"/accident_frame/{frame_filename}",
+                    "frame_path": f"/accident_frame/{image_filename}",
                     "frame_base64": frame_to_base64(accident_frame),
-                    "vehicle_type": detected_vehicle_type
+                    "vehicle_type": vehicle_type
                 }
 
         return {"accident_detected": False}
 
     except Exception as e:
-        print(f"Error processing video: {str(e)}")
         return {"error": str(e)}
 
 @app.post("/report_accident/")
-async def report_accident(
-    vehicle_type: str = Form(...),
-    file: UploadFile = File(...)
-):
-    """
-    Endpoint to directly report an accident with vehicle type information
-    """
-    # Validate vehicle type
+async def report_accident(vehicle_type: str = Form(...), file: UploadFile = File(...)):
     if vehicle_type.lower() not in VALID_VEHICLE_TYPES:
-        return {"error": f"Invalid vehicle type. Valid types are: {', '.join(VALID_VEHICLE_TYPES)}"}
-    
-    # Process the upload with the specified vehicle type
+        return {"error": f"Invalid vehicle type. Valid types: {', '.join(VALID_VEHICLE_TYPES)}"}
     return await upload_video(file=file, vehicle_type=vehicle_type)
 
 @app.get("/accident_video/{filename}")
 async def get_video(filename: str):
     file_path = os.path.join("videos", filename)
     if os.path.exists(file_path):
-        return FileResponse(
-            file_path,
-            media_type="video/mp4",
-            filename="accident_clip.mp4",
-            headers={
-                "Content-Disposition": "attachment; filename=accident_clip.mp4",
-                "Accept-Ranges": "bytes",
-            },
-        )
-    return {"error": "File not found"}
+        return FileResponse(file_path, media_type="video/mp4")
+    return {"error": "Video not found"}
 
 @app.get("/accident_frame/{filename}")
 async def get_frame(filename: str):
     file_path = os.path.join("images", filename)
     if os.path.exists(file_path):
-        return FileResponse(
-            file_path,
-            media_type="image/jpeg",
-            filename="accident_frame.jpg",
-        )
-    return {"error": "File not found"}
+        return FileResponse(file_path, media_type="image/jpeg")
+    return {"error": "Image not found"}
 
 @app.get("/accident_images/")
 async def get_all_accident_images():
-    """
-    Returns all accident images with date, time, and vehicle type.
-    """
     try:
-        # Get all records from MongoDB
         records = accident_logs.find({}, {"_id": 0, "timestamp": 1, "image_path": 1, "vehicle_type": 1})
-
-        # Format results into a list
-        results = []
-        for record in records:
-            results.append({
-                "timestamp": record["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
-                "image_path": record["image_path"],
-                "vehicle_type": record.get("vehicle_type", "unknown")
-            })
-
-        return JSONResponse(content={"images": results})
-
+        results = [{
+            "timestamp": r["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
+            "image_path": f"/accident_frame/{os.path.basename(r['image_path'])}",
+            "vehicle_type": r["vehicle_type"]
+        } for r in records]
+        return {"images": results}
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-    
+        return {"error": str(e)}
+
 @app.get("/accident_videos/")
 async def get_all_accident_videos():
-    """
-    Returns all accident videos with date, time, video path, image path, and vehicle type.
-    """
     try:
-        records = accident_logs.find({}, 
-            {"_id": 0, "timestamp": 1, "video_path": 1, "image_path": 1, "vehicle_type": 1})
-
-        results = []
-        for record in records:
-            results.append({
-                "timestamp": record["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
-                "video_path": record["video_path"],
-                "image_path": record.get("image_path", None),
-                "vehicle_type": record.get("vehicle_type", "unknown")
-            })
-
+        records = accident_logs.find({}, {"_id": 0, "timestamp": 1, "video_path": 1, "image_path": 1, "vehicle_type": 1})
+        results = [{
+            "timestamp": r["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
+            "video_path": f"/accident_video/{os.path.basename(r['video_path'])}",
+            "image_path": f"/accident_frame/{os.path.basename(r['image_path'])}",
+            "vehicle_type": r["vehicle_type"]
+        } for r in records]
         return {"videos": results}
-
     except Exception as e:
         return {"error": str(e)}
 
 @app.get("/vehicle_types/")
 async def get_vehicle_types():
-    """
-    Returns counts of accidents by vehicle type
-    """
     try:
         pipeline = [
-            {
-                "$group": {
-                    "_id": "$vehicle_type",
-                    "count": {"$sum": 1}
-                }
-            },
-            {
-                "$sort": {"count": -1}
-            }
+            {"$group": {"_id": "$vehicle_type", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}}
         ]
-        
         results = list(accident_logs.aggregate(pipeline))
-        formatted_results = [{"vehicle_type": r.get("_id", "unknown"), "count": r["count"]} for r in results]
-        
-        return {"vehicle_stats": formatted_results}
-    
+        return {"vehicle_stats": [{"vehicle_type": r["_id"], "count": r["count"]} for r in results]}
     except Exception as e:
         return {"error": str(e)}
- 
