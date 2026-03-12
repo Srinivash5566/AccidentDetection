@@ -43,7 +43,7 @@ except Exception as init_error:
     tClient = None
     
 # Gemini setup
-genai.configure(api_key="AIzaSyCkwbmGMWKltdkcDROczIqXoyfcD2KTLGU")
+genai.configure(api_key="_________________________________________________________________Gemini_API_Key__________________________________________")
 model = genai.GenerativeModel("gemini-1.5-flash")
 
 # MongoDB setup
